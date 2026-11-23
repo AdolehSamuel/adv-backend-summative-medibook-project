@@ -171,24 +171,30 @@ Boundaries: exactly 48 hours gives 50%, and exactly 24 hours gives 50%. The refu
 
 ## Design justifications
 
-> WRITE THESE IN YOUR OWN WORDS before submitting. Delete this note when done.
-
 ### Part C: Booking and cancellation
 
-<!-- Explain: how you stop two patients getting the same slot at the same instant
-(doctor row lock plus the UNIQUE index on doctor_id and active_slot), how the
-12-per-day cap is kept safe, why the refund is computed on the server, how the
-cancellation and refund are saved together, and how a cancelled slot becomes
-bookable again while the record is kept. -->
+**Two patients, one slot.** Every booking runs inside a MySQL transaction that starts by locking the doctor's row with `SELECT ... FOR UPDATE`. If two requests for the same doctor arrive at the same time, the second one waits until the first has finished. As a second safety net, the `uq_doctor_active_slot` UNIQUE index on `(doctor_id, active_slot)` means MySQL itself refuses a duplicate booking, and the API turns that error into a 409.
+
+**The 12-per-day cap.** Inside the same locked transaction, the code counts the doctor's booked appointments for that date. If there are already 12, the booking stops and the patient is offered the waitlist. Because the doctor row is locked, two requests cannot both see 11 and both insert, so the cap holds even under simultaneous requests.
+
+**Refunds are computed on the server.** The client never sends a refund amount. The server takes the real appointment time, the real amount paid and the current time, and works out the notice period itself, so the refund cannot be faked.
+
+**Refund boundaries.** More than 48 hours of notice gives 100%. From 24 hours up to and including 48 hours gives 50%, so exactly 48 hours and exactly 24 hours both give 50%. Less than 24 hours gives 0%. These values are defined once in `src/config/constants.js` and covered by unit tests.
+
+**Cancellation and refund succeed or fail together.** The status, refund amount and cancel time are written in a single UPDATE on one row, so MySQL saves all of them or none of them. A CHECK constraint also makes it impossible to have a cancelled row without a refund amount. The UPDATE only matches rows that are still booked, so cancelling twice returns a 409.
+
+**Cancelled slots become bookable again.** `active_slot` is a generated column that equals the appointment time while the status is `booked` and becomes NULL when it is `cancelled`. A UNIQUE index allows many NULLs, so the cancelled row stops blocking the slot but stays in the table as refund history.
 
 ### Part D: Audit log
 
-<!-- Explain: why you used fs/promises (async, non-blocking), how the logs folder
-is created, and why a logging failure never breaks the user's request. -->
+The logger uses `fs/promises` (`mkdir` and `appendFile`), which are non-blocking. A `*Sync` call would freeze the whole server while it writes, making every other user's request wait. `mkdir` with `recursive: true` creates the `logs/` folder on the first run and does nothing if it already exists. Each event is written as one JSON line. The write is wrapped in try/catch, and a failure is only printed to the console, so a logging problem never fails the user's booking or cancellation. The log is a record of what happened, not part of the booking itself.
 
 ### Part E: Queues and Redis
 
-<!-- Explain: how the waitlist works (one Redis list per doctor per day), why the
-worker is a separate process, what happens if the promoted booking fails (the
-patient is only removed after a successful booking), and how confirmation jobs
-are processed. -->
+**Waitlist.** When a slot or a doctor's whole day is full, the API returns 409 with an offer. If the patient sends the same request with `"join_waitlist": true`, they are pushed onto a Redis list for that doctor and day (`waitlist:doctor:<id>:<date>`) and the API returns 202. New patients join the end of the list, so it is first come, first served.
+
+**Separate worker.** A cancellation pushes a "slot freed" job to Redis. The worker runs as its own process (`npm run worker`), separate from the web server, so slow or failing background jobs never slow down the API, and either process can restart without the other.
+
+**If the promoted booking fails.** The worker first looks at the first waitlisted patient without removing them, then tries to book them using the same locked booking function as the API. The patient is removed from the waitlist only after the booking succeeds. If the booking fails, they stay first in line. If the database is unavailable, the job is put back on the queue and retried after a short delay. This way a patient can never disappear from both the queue and the appointments table.
+
+**Confirmation jobs.** Every confirmed appointment, whether booked through the API or promoted from the waitlist, queues a confirmation job. The worker processes it by writing a `confirmation_sent` line with the message to `logs/audit.log`, which stands in for sending a real SMS or email.
