@@ -2,7 +2,7 @@
 
 Backend for a community clinic's appointment booking system, built with Node.js, Express, MySQL and Redis.
 
-**Video walkthrough:** PASTE_YOUR_VIDEO_LINK_HERE
+**Video walkthrough:** https://canva.link/3lhe40lkeit0lkl
 
 **Schema diagram:** [schema-diagram.png](schema-diagram.png)
 
